@@ -27,6 +27,12 @@ import urllib.request
 import rumps
 from pynput import keyboard
 
+def log(msg):
+    """Timestamped logging — the old log had no timestamps, which made it
+    impossible to correlate failures with idle/sleep/device events."""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
 try:
     from Foundation import NSMakeRect
     from AppKit import (NSWindow, NSColor, NSTextField, NSFont,
@@ -35,7 +41,7 @@ try:
                         NSCenterTextAlignment)
     HAS_APPKIT = True
 except Exception as _e:
-    print(f"AppKit overlay unavailable: {_e}", flush=True)
+    log(f"AppKit overlay unavailable: {_e}")
     HAS_APPKIT = False
 
 try:
@@ -48,6 +54,14 @@ HOTKEY = "<cmd>+<shift>+d"
 REC_BIN = shutil.which("rec") or "/opt/homebrew/bin/rec"  # launchd PATH has no /opt/homebrew/bin
 REC_ERR_LOG = os.path.expanduser("~/.pi/agent/logs/dictate-menubar-rec.err")
 WAV_PATH = os.path.expanduser("~/.pi/agent/logs/dictate-last.wav")
+QUIET_RMS = 0.005  # failed cycles measured rms~0.002; working ones ~0.015
+
+try:
+    import audio_devices  # CoreAudio introspection, same directory
+except Exception as _e:
+    audio_devices = None
+    print(f"audio_devices unavailable: {_e}", flush=True)
+
 
 IDLE, REC, BUSY = "idle", "recording", "busy"
 
@@ -61,11 +75,11 @@ def _wait_mods_released(timeout: float = 10.0) -> None:
     t0 = time.time()
     while any(MODS.values()) and time.time() - t0 < timeout:
         time.sleep(0.05)
-    print(f"mods at delivery: {dict(MODS)} (waited {time.time()-t0:.2f}s)", flush=True)
+    log(f"mods at delivery: {dict(MODS)} (waited {time.time()-t0:.2f}s)")
 
 
 def notify(title, text=""):
-    print(f"notify: {title} | {text}", flush=True)
+    log(f"notify: {title} | {text}")
     # osascript channel — the one proven to display banners on this machine
     try:
         subprocess.run(
@@ -74,7 +88,7 @@ def notify(title, text=""):
              f'with title "Dictation" subtitle {json.dumps(str(title)[:80])}'],
             capture_output=True, timeout=5)
     except Exception as e:
-        print(f"notify failed: {type(e).__name__}: {e}", flush=True)
+        log(f"notify failed: {type(e).__name__}: {e}")
 
 
 # Chromium-family apps that swallow session-level synthetic ⌘V
@@ -101,10 +115,10 @@ def _type_text_quartz(text: str) -> bool:
                 CGEventKeyboardSetUnicodeString(ev, len(chunk), chunk)
                 CGEventPost(kCGHIDEventTap, ev)
             time.sleep(0.02)
-        print("deliver method: typing (quartz unicode)", flush=True)
+        log("deliver method: typing (quartz unicode)")
         return True
     except Exception as e:
-        print(f"quartz typing failed: {type(e).__name__}: {e}", flush=True)
+        log(f"quartz typing failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -118,9 +132,9 @@ def _type_text(text: str) -> bool:
          f'tell application "System Events" to keystroke "{t}"'],
         capture_output=True, timeout=15)
     if r.returncode == 0:
-        print("deliver method: typing (System Events)", flush=True)
+        log("deliver method: typing (System Events)")
         return True
-    print(f"typing failed: {r.stderr.decode()[:120]}", flush=True)
+    log(f"typing failed: {r.stderr.decode()[:120]}")
     return False
 
 
@@ -130,9 +144,9 @@ def _paste_keystroke_osascript() -> bool:
          'tell application "System Events" to keystroke "v" using command down'],
         capture_output=True, timeout=5)
     if r.returncode == 0:
-        print("deliver method: osascript ⌘V", flush=True)
+        log("deliver method: osascript ⌘V")
         return True
-    print(f"osascript paste failed ({r.returncode}): {r.stderr.decode()[:120]}", flush=True)
+    log(f"osascript paste failed ({r.returncode}): {r.stderr.decode()[:120]}")
     return False
 
 
@@ -141,7 +155,7 @@ def _paste_keystroke_pynput() -> None:
     c.press(keyboard.Key.cmd)
     c.tap("v")
     c.release(keyboard.Key.cmd)
-    print("deliver method: pynput ⌘V", flush=True)
+    log("deliver method: pynput ⌘V")
 
 
 def deliver_text(text: str) -> str:
@@ -156,7 +170,7 @@ def deliver_text(text: str) -> str:
         target = app.localizedName()
         bundle_id = app.bundleIdentifier() or ""
     except Exception as e:
-        print(f"frontmost probe failed: {type(e).__name__}: {e}", flush=True)
+        log(f"frontmost probe failed: {type(e).__name__}: {e}")
 
     if any(s in bundle_id.lower() for s in STUBBORN):
         if _type_text(text):
@@ -189,6 +203,7 @@ class DictateApp(rumps.App):
         self.title = "🎙"
         self._overlay = None
         self._ovq = queue.Queue()  # overlay ops from any thread -> main thread
+        self._mic = "?"  # cached default input name (mic poller)
 
         self.menu = [
             rumps.MenuItem("Start / Stop dictation"),
@@ -199,7 +214,9 @@ class DictateApp(rumps.App):
         ]
 
         threading.Thread(target=self._run_event_tap, daemon=True).start()
-        print("global hotkey registered:", HOTKEY, flush=True)
+        log(f"global hotkey registered: {HOTKEY}")
+        if audio_devices:
+            threading.Thread(target=self._run_mic_poller, daemon=True).start()
 
         # main-thread pump that applies overlay changes
         self._timer = rumps.Timer(self._drain_overlay, 0.10)
@@ -208,7 +225,7 @@ class DictateApp(rumps.App):
         self._tap_holder = []
         self._watchdog = rumps.Timer(self._tap_watchdog, 5.0)
         self._watchdog.start()
-        print("overlay pump started, AppKit:", HAS_APPKIT, flush=True)
+        log(f"overlay pump started, AppKit: {HAS_APPKIT}")
 
     def _tap_watchdog(self, _sender=None):
         if self._tap_holder and CGEventTapEnable:
@@ -259,7 +276,7 @@ class DictateApp(rumps.App):
                                  frame.origin.y + frame.size.height - 140))
             win.orderFrontRegardless()
         except Exception as e:
-            print(f"overlay show failed: {type(e).__name__}: {e}", flush=True)
+            log(f"overlay show failed: {type(e).__name__}: {e}")
 
     def _overlay_hide(self):
         if not HAS_APPKIT or self._overlay is None:
@@ -267,10 +284,36 @@ class DictateApp(rumps.App):
         try:
             self._overlay[0].orderOut_(None)
         except Exception as e:
-            print(f"overlay hide failed: {type(e).__name__}: {e}", flush=True)
+            log(f"overlay hide failed: {type(e).__name__}: {e}")
 
     def _ov(self, op, text="", rgb=(1, 1, 1)):
         self._ovq.put((op, text, rgb))
+
+    def _run_mic_poller(self):
+        """Watch default input device + device set; log every change with a
+        timestamp (no audio stream is opened — non-perturbing).
+        Instrumentation for the after-idle 'no speech detected' bug: failed
+        cycles captured input at ~10x lower level (rms ~0.002 vs ~0.015),
+        flipping without app restarts — prime suspect is macOS switching the
+        default input between the Continuity iPhone mic and the built-in
+        mic (or the Continuity stream degrading when the iPhone locks)."""
+        last_def = None
+        last_set = None
+        while True:
+            try:
+                dev, name = audio_devices.default_input_device()
+                devs = [n for _, n in audio_devices.all_devices()]
+                if (dev, name) != last_def:
+                    log(f"mic-poller: default input -> {name!r} (id {dev})")
+                    last_def = (dev, name)
+                if devs != last_set:
+                    log(f"mic-poller: device set -> {devs}")
+                    last_set = devs
+                if name:
+                    self._mic = name
+            except Exception as e:
+                log(f"mic-poller failed: {type(e).__name__}: {e}")
+            time.sleep(10)
 
     # ---------------- core toggle ----------------
 
@@ -290,7 +333,7 @@ class DictateApp(rumps.App):
                                 kCGEventFlagMaskShift)
             from Foundation import kCFRunLoopCommonModes
         except Exception as e:
-            print(f"Quartz tap import failed: {e}", flush=True)
+            log(f"Quartz tap import failed: {e}")
             return
         # NOTE: do NOT add kCGEventTapDisabledBy* to the mask — their enum
         # values (0xFFFFFFFE…) make CGEventMaskBit overflow in pyobjc and
@@ -305,32 +348,32 @@ class DictateApp(rumps.App):
             MODS["shift"] = bool(flags & kCGEventFlagMaskShift)
             if etype == kCGEventKeyDown:
                 code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-                if code == 9 and MODS["cmd"] and MODS["shift"]:  # keycode 9 = D
+                if code == 2 and MODS["cmd"] and MODS["shift"]:  # keycode 2 = D (9 is V!)
                     try:
                         self.toggle()
                     except Exception as e:
-                        print(f"toggle failed: {type(e).__name__}: {e}", flush=True)
+                        log(f"toggle failed: {type(e).__name__}: {e}")
                     return None  # swallow — apps never see ⌘⇧D
             return event
 
         tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                kCGEventTapOptionDefault, mask, callback, None)
         if tap is None:
-            print("event tap create FAILED (accessibility?) — hotkey dead", flush=True)
+            log("event tap create FAILED (accessibility?) — hotkey dead")
             return
         tap_holder.append(tap)
         self._tap_holder = tap_holder
         source = CFMachPortCreateRunLoopSource(None, tap, 0)
         rl = CFRunLoopGetCurrent()
         CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes)
-        print("suppressing event tap active", flush=True)
+        log("suppressing event tap active")
         try:
             CFRunLoopRun()
         except Exception as e:
-            print(f"runloop died: {type(e).__name__}: {e}", flush=True)
+            log(f"runloop died: {type(e).__name__}: {e}")
 
     def toggle(self, _=None):
-        print(f"hotkey pressed, state={self.state}", flush=True)
+        log(f"hotkey pressed, state={self.state}")
         if self.state == IDLE:
             self.start()
         elif self.state == REC:
@@ -357,7 +400,7 @@ class DictateApp(rumps.App):
         self.state = REC
         self.title = "●"
         self._ov("show", "● REC", (1.0, 0.22, 0.19))
-        print("recording…", flush=True)
+        log(f"recording… [mic: {self._mic}]")
 
     def stop(self):
         if self.state != REC:
@@ -408,6 +451,12 @@ class DictateApp(rumps.App):
             except Exception:
                 self.proc.kill()
             self.proc = None
+        if getattr(self, "_rec_err", None):
+            try:
+                self._rec_err.close()
+            except Exception:
+                pass
+            self._rec_err = None
         time.sleep(0.35)  # let sox finalize the wav header
         if self.cancelled:
             self._done()
@@ -423,18 +472,19 @@ class DictateApp(rumps.App):
             notify("recording failed", (f"{e}"[:60] + " | " + rec_err)[-120:])
             self._done()
             return
-        print(f"posting {len(audio)} bytes to musci-server…", flush=True)
+        log(f"posting {len(audio)} bytes to musci-server… [mic: {self._mic}]")
+        rms = peak = None
         try:
             import numpy as np
             import soundfile as sf
             w, sr = sf.read(self.wav, dtype="float32")
             rms = float(np.sqrt((w.astype(np.float64) ** 2).mean()))
             peak = float(np.abs(w).max())
-            print(f"audio: sr={sr} dur={len(w)/sr:.1f}s rms={rms:.5f} peak={peak:.4f}", flush=True)
+            log(f"audio: sr={sr} dur={len(w)/sr:.1f}s rms={rms:.5f} peak={peak:.4f}")
             if rms < 1e-4:
                 notify("recording is silent", "check microphone input device/level")
         except Exception as e:
-            print(f"audio probe skipped: {type(e).__name__}: {e}", flush=True)
+            log(f"audio probe skipped: {type(e).__name__}: {e}")
         try:
             req = urllib.request.Request(MUSCI_URL, data=audio,
                 headers={"Content-Type": "audio/wav"}, method="POST")
@@ -444,24 +494,67 @@ class DictateApp(rumps.App):
             notify("ASR failed", f"{type(e).__name__}: {str(e)[:80]}")
             self._done()
             return
-        print(f"asr returned {len(text)} chars: {text[:100]!r}", flush=True)
+        log(f"asr returned {len(text)} chars: {text[:100]!r}")
+
+        # After-idle bug mitigation: after long idle the captured level can
+        # collapse ~10x (rms ~0.002 vs ~0.015 when healthy — see mic-poller
+        # notes). If ASR heard nothing in ultra-quiet audio, amplify and
+        # retry once instead of losing the dictation.
+        if not text and rms is not None and rms < QUIET_RMS and peak > 1e-4:
+            try:
+                import io
+                import numpy as np
+                import soundfile as sf
+                w, sr = sf.read(self.wav, dtype="float32")
+                gain = min(0.5 / peak, 50.0)
+                log(f"amplify-rescue: gain {gain:.1f}x (rms {rms:.5f}, mic {self._mic})")
+                w = np.clip(w * gain, -1.0, 1.0)
+                buf = io.BytesIO()
+                sf.write(buf, w, sr, subtype="PCM_16", format="WAV")
+                req = urllib.request.Request(MUSCI_URL, data=buf.getvalue(),
+                    headers={"Content-Type": "audio/wav"}, method="POST")
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    text = json.loads(r.read().decode()).get("text", "").strip()
+                log(f"amplify-rescue: asr returned {len(text)} chars: {text[:100]!r}")
+            except Exception as e:
+                log(f"amplify-rescue failed: {type(e).__name__}: {e}")
+
+        # Ground truth for the diagnosis: keep the audio of every failed /
+        # ultra-quiet cycle (bounded retention). Synthetic tests proved quiet
+        # speech still transcribes — so a failed cycle means the user's voice
+        # wasn't really IN the captured signal; these archives are how we
+        # confirm which mic/mode produced it.
+        if not text or (rms is not None and rms < QUIET_RMS):
+            try:
+                import glob
+                arch_dir = os.path.join(os.path.dirname(WAV_PATH), "dictate-failed")
+                os.makedirs(arch_dir, exist_ok=True)
+                mic_tag = "".join(c if c.isalnum() else "_" for c in self._mic)[:32]
+                dst = os.path.join(arch_dir, time.strftime("%Y%m%d-%H%M%S") +
+                                   f"-rms{rms if rms is None else round(rms, 5)}-{mic_tag}.wav")
+                shutil.copyfile(self.wav, dst)
+                for old in sorted(glob.glob(os.path.join(arch_dir, "*.wav")))[:-10]:
+                    os.remove(old)
+                log(f"archived failed cycle -> {dst}")
+            except Exception as e:
+                log(f"archive failed: {type(e).__name__}: {e}")
 
         if text:
             try:
                 target = deliver_text(text)
-                print(f"delivered -> {target}", flush=True)
+                log(f"delivered -> {target}")
                 notify(f"✓ pasted to {target}", text[:120])
             except Exception as e:
                 notify("delivery failed", f"{type(e).__name__}: {str(e)[:80]}")
         else:
-            notify("no speech detected")
+            notify("no speech detected", f"mic: {self._mic}, rms {rms if rms is None else round(rms, 5)}")
         self._done()
 
     def _done(self):
         self.state = IDLE
         self.title = "🎙"
         self._ov("hide")
-        print("cycle complete", flush=True)
+        log("cycle complete")
 
 
 if __name__ == "__main__":
