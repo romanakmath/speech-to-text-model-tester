@@ -13,11 +13,15 @@ with `jiwer` + Whisper's official `EnglishTextNormalizer`.
 
 | Engine (runtime) | **Measured WER (subset)** | Published WER (full set) | Wall time, 202 utts |
 |---|---:|---:|---:|
+| **Oruk-Fourier-2B** (PyTorch MPS, bf16, 3-beam)* | **1.50%** | 1.04% (test-clean, 3-beam) | 202 s (M5 Max) |
+| **Oruk-Fourier-2B-8bit** (MLX via mlx-audio, greedy)* | **1.55%** | 1.40% (test-clean, Q8_0 GGUF) | **48 s** (M5 Max) |
 | **Musci-ASR-qwen-1019** (PyTorch MPS, fp16) | **1.63%** | 1.03% (test-clean, model card) | 329 s |
 | **Qwen3-ASR-1.7B-8bit** (MLX via mlx-audio) | **1.82%** | — | **81 s** |
 | Parakeet-TDT-0.6B-v2 (MLX bf16) | 2.05% | ~1.6–1.7% (test-clean) | 515 s |
 | Voxtral-Mini-4B-Realtime-2602 (MLX 4bit) | 2.51% | — | 1184 s |
 | Deepgram Nova-3 (cloud batch) | 3.11% | 5.2% (AA aggregate, harder mix) | 209 s |
+
+*`oruk/oruk-fourier-2b` (`CC BY-NC 4.0`, English-specialized Qwen3-ASR 1.7B) measured on the identical 202-utt manifest (Apple M5 Max, 128 GB); `oruk-fourier-mps` uses the checkpoint's default 3-beam search (`generation_config.json`: `num_beams=3, do_sample=False`), while `oruk-fourier-mlx` uses greedy MLX 8-bit decoding. Wall times are not cross-host comparable to M4 Pro, while WER is host-independent.
 
 **Methodology validation:** Musci and Parakeet land within ~0.5 pt of their
 published full-set scores — the expected subset-sampling offset. The pipeline
@@ -112,6 +116,8 @@ python -m speechtester.score \
 | id | weights | runtime | notes |
 |---|---|---|---|
 | `qwen3asr-mlx` | `mlx-community/Qwen3-ASR-1.7B-8bit` | MLX | fastest accurate local ear; auto-formats numbers; recovers camelCase |
+| `oruk-fourier-mlx` | `oruk/oruk-fourier-2b` (`mlx/8bit`) | MLX | English-specialized Qwen3-ASR 1.7B (`CC BY-NC 4.0`), 8-bit MLX |
+| `oruk-fourier-mps` | `oruk/oruk-fourier-2b` | PyTorch MPS | English-specialized Qwen3-ASR 1.7B (`CC BY-NC 4.0`), native BF16 |
 | `musci-mps` | `Musci-research/Musci-ASR-qwen-1019-hf` | PyTorch MPS | published 4.36% leaderboard-average (GRPO fine-tune of Qwen3-ASR) |
 | `parakeet-mlx` | `mlx-community/parakeet-tdt-0.6b-v2` | MLX | NVIDIA TDT, punctuation + caps built in |
 | `voxtral-mlx` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | MLX | streaming model, batch benchmark here |

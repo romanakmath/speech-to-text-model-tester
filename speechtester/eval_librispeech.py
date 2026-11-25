@@ -39,7 +39,11 @@ def run(engine: str, manifest_path: str, out: str, model: str | None, data_root:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--engine", required=True, help="qwen3asr-mlx | musci-mps | parakeet-mlx | voxtral-mlx")
+    ap.add_argument(
+        "--engine",
+        required=True,
+        help="qwen3asr-mlx | oruk-fourier-mlx | musci-mps | oruk-fourier-mps | parakeet-mlx | voxtral-mlx",
+    )
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out", default=None, help="output JSON (default hyp_<engine>.json)")
     ap.add_argument("--model", default=None, help="override HF model id")
