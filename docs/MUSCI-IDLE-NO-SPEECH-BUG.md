@@ -1,80 +1,79 @@
-# Musci dictation: after-idle "no speech detected" bug
+# Musci dictation: after-standby bugs — full diagnosis (2026-11-28)
 
-## Symptom
+Three distinct root causes were confirmed for the user-visible symptoms
+("after reopening from standby I wait unnecessarily long", "recording starts
+but repressing does nothing, nothing gets pasted", intermittent
+"no speech detected").
 
-After a long idle period, pressing ⌘⇧D shows the ● REC overlay and records
-fine, but on stop the notification says **"no speech detected"** — even though
-the user was speaking into the microphone.
+## 1. App crash at first overlay draw after standby → dictation silently lost
 
-## Evidence from the pre-fix log (no timestamps existed yet)
+**Symptom**: press ⌘⇧D → "● REC" appears → press to stop → *nothing happens*,
+nothing pasted.
 
-```
-posting 1695132 bytes to musci-server…
-audio: sr=16000 dur=26.5s rms=0.00196 peak=0.0193
-asr returned 0 chars: ''
-notify: no speech detected
-```
+**Evidence**: crash reports `Python-2026-11-28-142852.ips` (also 11-23, 11-24):
+SIGABRT/SIGSEGV in `CA::Transaction::commit` → `CoreGraphics dl_Finalize` →
+`POINTER_BEING_FREED_WAS_NOT_ALLOCATED`, both main thread and a CA thread
+finalizing the same display-list resources. The dictation-menubar app kept ONE
+overlay NSWindow alive for days; macOS invalidates its CoreGraphics
+display-list during standby; the first redraw after wake ("● REC") frees a
+stale pointer → abort. KeepAlive relaunches the app instantly, so the
+repress "works" again — but the dictation recorded before the crash is lost
+(user perceives: "nothing happened"). Crash cadence ≈ every 1–4 days,
+always the first dictation after standby.
 
-- ~13 failed cycles: **rms ≈ 0.001–0.002, peak ≈ 0.01–0.03** → ASR empty.
-- Working cycles: **rms ≈ 0.014–0.018, peak ≈ 0.10–0.13** — ~10× louder.
-- Levels flip between quiet/loud across consecutive recordings **without
-  app restarts** → the changing state is in macOS, not in our code.
-- musci-server was healthy throughout (keep-warm OK, 200 responses).
-- sox stderr shows only the usual 16k→48k rate warning + one rare
-  `coreaudio: unhandled buffer overrun`.
+**Fix** (`dictate-menubar.py`): create the overlay window fresh on every
+show (destroy the old one). A window now lives at most one dictation cycle,
+so it never carries stale display-list resources across sleep/wake.
+Plus: kill orphaned `rec` children at startup (a crashed parent leaves sox
+recording forever — holds the mic, writes to an unlinked, ever-growing file),
+and show a "still transcribing…" notification when the hotkey is pressed
+during BUSY (previously silently ignored).
 
-## Root cause (leading, pending confirmation)
+## 2. First transcription after standby takes ~20–40 s ("wait unnecessarily long")
 
-The machine has a **Continuity mic — "iPhone de Roman Microphone"** — plus
-"MacBook Pro Microphone" and a virtual Teams device. The prime suspects:
+**Evidence**: musci-server keep-warm log: normal inference 0.83 s, but
+periodically 21–43 s — the 4 GB of MPS weights get paged out around standby;
+`time.sleep(240)` in the keep-warm thread freezes during sleep, and the
+first inference after wake pays the full page-in cost. If that first
+inference is the user's dictation, they wait.
 
-- **H1**: after idle the iPhone locks/leaves range → macOS switches the
-  default input device under `rec` (sox records from *whatever is default*),
-  and the user's voice lands on a far/dead mic at ~10× lower level.
-- **H2**: the Continuity mic stays default but delivers a degraded
-  ultra-quiet stream when the iPhone locks.
+**Fix** (`musci-server.py`): NSWorkspaceDidWakeNotification observer
+(verified working) triggers an immediate warm-up inference at wake, so the
+cost is paid before the first dictation. Keep-warm heartbeat unchanged.
+Also: timestamped server logs + per-request duration logging.
 
-### Falsified sub-hypothesis (important)
+## 3. Intermittent empty transcription on healthy audio → "no speech detected"
 
-"Quiet speech fails ASR" is **false**: scaling a known-good recording down to
-rms 0.002 still transcribes perfectly (`test_idle_bug_rescue.py`). Therefore
-in the failed cycles the user's voice was (near-)absent from the captured
-signal — a wrong or dead source, not a mere level drop.
+**Evidence**: archived failed cycles (2026-11-28 00:23, 14:57, 15:01) show
+healthy levels (rms 0.008–0.010, voiced/syllabic statistics identical to
+known-good recordings, mic = MacBook Pro Microphone, no default-input flip
+in the mic-poller log), yet the ASR returns '' — **deterministically**, on
+re-post, AND on CPU+float32 (not an MPS/f16 numerics issue — it's a model
+failure mode). Perturbation experiments: the exact same samples with
+ε-dither (σ=1e-4) or lead-in silence transcribe perfectly; gain/DC-removal/
+truncation do not. 3 occurrences in ~100 dictations.
 
-## What was deployed (2026-11-18)
+**Fix** (`musci-server.py`): on empty result for clips ≥ 1 s, retry with
+(1) dither σ=1e-4 (seed 42 — recovered all three archived failures),
+(2) dither σ=1e-4 + 100 ms leading silence. Costs an extra 1–3 s only in
+the rare failing case. The client-side amplify-rescue from 2026-11-18
+remains as additional insurance.
 
-In `pi-agent/dictate-menubar.py` + `pi-agent/audio_devices.py`:
+## Earlier hypothesis (2026-11-18) — status
 
-1. **Timestamped logging** for every line.
-2. **Mic poller** (CoreAudio, no audio stream opened — non-perturbing):
-   logs every default-input-device change and device-set change with a
-   timestamp, continuously, even while idle. This is the instrument that
-   will name the culprit on the next occurrence.
-3. **Failed-cycle audio archive**: every cycle that ends empty or below
-   `QUIET_RMS = 0.005` is copied to `~/.pi/agent/logs/dictate-failed/`
-   (last 10 kept) — ground-truth audio for analysis.
-4. **Amplify-rescue**: if ASR returns nothing and rms < 0.005, the audio is
-   amplified (peak → 0.5, gain capped 50×) and re-posted once. Cheap
-   insurance for the borderline case.
-5. "no speech detected" notification now names the mic + rms.
-6. Synced the hotkey keycode fix (2 = D; 9 is V) into the repo, fixed an
-   fd leak on the sox stderr handle.
+The "default input device flip after idle" hypothesis was **not confirmed**:
+the mic-poller has logged zero default-input flips across 10 days; failures
+showed the expected mic with healthy levels. The original pre-fix log's
+quiet failures (rms ~0.002) may have been the same model issue combined
+with far-field speech; the instrumentation deployed then (timestamps,
+mic-poller, archives) is what made today's full diagnosis possible.
 
-## How to read the next occurrence
+## Verification
 
-1. `grep mic-poller ~/.pi/agent/logs/dictate-menubar.log` — was there a
-   default-input flip right before the failed cycle?
-2. The failed cycle's own line shows `[mic: <name>]` — which device was it?
-3. `~/.pi/agent/logs/dictate-failed/*.wav` — listen / inspect; does it
-   contain the user's voice at all?
-
-If H1 is confirmed (default flips away from the intended mic), the fix is to
-stop relying on the default input: record from an explicitly chosen device
-(ffmpeg `-f avfoundation -i :<idx>` supports device selection; sox coreaudio
-does not) with a preference list, e.g. iPhone mic when present, else built-in.
-
-## Harness
-
-`pi-agent/test_idle_bug_rescue.py` — reproduces the quiet-audio signature
-against the live musci-server and verifies the rescue path (also proved the
-model's level-robustness that falsified the simple theory).
+- `test_empty_asr_retry.py` — post-deploy: all archived failed cycles must
+  transcribe through the fixed server.
+- `test_idle_bug_rescue.py` — quiet-audio level robustness (2026-11-18).
+- Wake observer wiring verified standalone (manual notification post).
+- Crash fix verified by code + compile; real-world confirmation = absence of
+  new crash reports in `~/Library/Logs/DiagnosticReports/` after standby
+  cycles.

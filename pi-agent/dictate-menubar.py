@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -217,6 +218,7 @@ class DictateApp(rumps.App):
         log(f"global hotkey registered: {HOTKEY}")
         if audio_devices:
             threading.Thread(target=self._run_mic_poller, daemon=True).start()
+        self._kill_orphan_rec()
 
         # main-thread pump that applies overlay changes
         self._timer = rumps.Timer(self._drain_overlay, 0.10)
@@ -248,26 +250,39 @@ class DictateApp(rumps.App):
         if not HAS_APPKIT:
             return
         try:
-            if self._overlay is None:
-                win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                    NSMakeRect(0, 0, 260, 64), 0, 2, False)
-                win.setLevel_(25)  # NSStatusWindowLevel — above all normal windows
-                win.setOpaque_(False)
-                win.setHasShadow_(True)
-                win.setIgnoresMouseEvents_(True)
-                win.setCollectionBehavior_(
-                    NSWindowCollectionBehaviorCanJoinAllSpaces |
-                    NSWindowCollectionBehaviorFullScreenAuxiliary)
-                label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 64))
-                label.setEditable_(False)
-                label.setBordered_(False)
-                label.setDrawsBackground_(False)
-                label.setAlignment_(NSCenterTextAlignment)
-                label.setFont_(NSFont.boldSystemFontOfSize_(24))
-                label.setTextColor_(NSColor.whiteColor())
-                win.contentView().addSubview_(label)
-                self._overlay = (win, label)
-            win, label = self._overlay
+            # CRASH FIX: create the window FRESH on every show. The old code
+            # kept one NSWindow alive for days across sleep/wake cycles;
+            # macOS invalidates its CoreGraphics display-list resources during
+            # standby, and the first redraw after wake double-freed a stale
+            # pointer -> SIGABRT/SIGSEGV (crash reports 2026-11-23/24/28),
+            # killing the app mid-recording and silently losing the dictation
+            # ("pressed to stop and nothing happened").
+            if self._overlay is not None:
+                try:
+                    old_win = self._overlay[0]
+                    old_win.orderOut_(None)
+                    old_win.close()
+                except Exception:
+                    pass
+                self._overlay = None
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, 260, 64), 0, 2, False)
+            win.setLevel_(25)  # NSStatusWindowLevel — above all normal windows
+            win.setOpaque_(False)
+            win.setHasShadow_(True)
+            win.setIgnoresMouseEvents_(True)
+            win.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces |
+                NSWindowCollectionBehaviorFullScreenAuxiliary)
+            label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 64))
+            label.setEditable_(False)
+            label.setBordered_(False)
+            label.setDrawsBackground_(False)
+            label.setAlignment_(NSCenterTextAlignment)
+            label.setFont_(NSFont.boldSystemFontOfSize_(24))
+            label.setTextColor_(NSColor.whiteColor())
+            win.contentView().addSubview_(label)
+            self._overlay = (win, label)
             win.setBackgroundColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 rgb[0], rgb[1], rgb[2], 0.94))
             label.setStringValue_(text)
@@ -314,6 +329,25 @@ class DictateApp(rumps.App):
             except Exception as e:
                 log(f"mic-poller failed: {type(e).__name__}: {e}")
             time.sleep(10)
+
+    def _kill_orphan_rec(self):
+        """A crash mid-recording leaves the sox `rec` child running forever:
+        it holds the microphone open and writes to an unlinked wav that grows
+        without bound. Kill leftovers matching OUR exact invocation."""
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,command="],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                line = line.strip()
+                if REC_BIN in line and WAV_PATH in line:
+                    pid = int(line.split()[0])
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        log(f"killed orphaned rec (pid {pid})")
+                    except ProcessLookupError:
+                        pass
+        except Exception as e:
+            log(f"orphan rec cleanup failed: {type(e).__name__}: {e}")
 
     # ---------------- core toggle ----------------
 
@@ -378,6 +412,14 @@ class DictateApp(rumps.App):
             self.start()
         elif self.state == REC:
             self.stop()
+        elif self.state == BUSY:
+            # first request after standby can take ~20-40 s (weights paged
+            # out); make the wait visible instead of silently swallowing the
+            # hotkey press ("I repressed and nothing happened")
+            now = time.time()
+            if now - getattr(self, "_busy_noted", 0.0) > 10:
+                self._busy_noted = now
+                notify("still transcribing…", "server may be warming up after standby")
 
     def start(self):
         if self.state != IDLE:
