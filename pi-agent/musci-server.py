@@ -23,7 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOST, PORT = "127.0.0.1", 31046
 MODEL_ID = "Musci-research/Musci-ASR-qwen-1019-hf"
 KEEP_WARM_S = 240  # tiny self-transcription keeps weights + kernels resident
-MIN_RETRY_DUR_S = 1.0  # only retry-empty when the user actually dictated
+MIN_RETRY_DUR_S = 1.0   # only retry when the user actually dictated
+MIN_RETRY_RMS = 1e-4    # and the audio actually contains sound (not silence)
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -98,7 +99,8 @@ def transcribe_wav(b: bytes) -> str:
     when the clip is long enough that the user was really dictating."""
     wav, sr = _decode_wav(b)
     text = transcribe_array(wav, sr)
-    if text.strip() or len(wav) / sr < MIN_RETRY_DUR_S:
+    has_sound = float(np.sqrt((wav.astype(np.float64) ** 2).mean())) > MIN_RETRY_RMS
+    if text.strip() or len(wav) / sr < MIN_RETRY_DUR_S or not has_sound:
         return text
 
     variants = [

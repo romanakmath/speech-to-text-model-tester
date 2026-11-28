@@ -55,7 +55,7 @@ HOTKEY = "<cmd>+<shift>+d"
 REC_BIN = shutil.which("rec") or "/opt/homebrew/bin/rec"  # launchd PATH has no /opt/homebrew/bin
 REC_ERR_LOG = os.path.expanduser("~/.pi/agent/logs/dictate-menubar-rec.err")
 WAV_PATH = os.path.expanduser("~/.pi/agent/logs/dictate-last.wav")
-QUIET_RMS = 0.005  # failed cycles measured rms~0.002; working ones ~0.015
+QUIET_RMS = 0.005  # below this we archive the wav even on success (diagnostics)
 
 try:
     import audio_devices  # CoreAudio introspection, same directory
@@ -297,9 +297,16 @@ class DictateApp(rumps.App):
         if not HAS_APPKIT or self._overlay is None:
             return
         try:
-            self._overlay[0].orderOut_(None)
+            # Full teardown (not just orderOut): with close-on-hide, no
+            # NSWindow exists between dictations — one can never sleep and
+            # wake with invalidated display-list resources (crash cause).
+            win, _label = self._overlay
+            win.orderOut_(None)
+            win.close()
         except Exception as e:
             log(f"overlay hide failed: {type(e).__name__}: {e}")
+        finally:
+            self._overlay = None
 
     def _ov(self, op, text="", rgb=(1, 1, 1)):
         self._ovq.put((op, text, rgb))
@@ -307,11 +314,12 @@ class DictateApp(rumps.App):
     def _run_mic_poller(self):
         """Watch default input device + device set; log every change with a
         timestamp (no audio stream is opened — non-perturbing).
-        Instrumentation for the after-idle 'no speech detected' bug: failed
-        cycles captured input at ~10x lower level (rms ~0.002 vs ~0.015),
-        flipping without app restarts — prime suspect is macOS switching the
-        default input between the Continuity iPhone mic and the built-in
-        mic (or the Continuity stream degrading when the iPhone locks)."""
+        Deployed 2026-11-18 to test the default-input-flip hypothesis for the
+        after-idle 'no speech detected' bug; 10 days of logs showed ZERO
+        default-input flips and failures with healthy levels from the right
+        mic — hypothesis falsified (real cause: model edge case, fixed
+        server-side). Kept as cheap standing instrumentation: any future
+        input-device weirdness lands in the log with timestamps."""
         last_def = None
         last_set = None
         while True:
@@ -544,28 +552,10 @@ class DictateApp(rumps.App):
             return
         log(f"asr returned {len(text)} chars: {text[:100]!r}")
 
-        # After-idle bug mitigation: after long idle the captured level can
-        # collapse ~10x (rms ~0.002 vs ~0.015 when healthy — see mic-poller
-        # notes). If ASR heard nothing in ultra-quiet audio, amplify and
-        # retry once instead of losing the dictation.
-        if not text and rms is not None and rms < QUIET_RMS and peak > 1e-4:
-            try:
-                import io
-                import numpy as np
-                import soundfile as sf
-                w, sr = sf.read(self.wav, dtype="float32")
-                gain = min(0.5 / peak, 50.0)
-                log(f"amplify-rescue: gain {gain:.1f}x (rms {rms:.5f}, mic {self._mic})")
-                w = np.clip(w * gain, -1.0, 1.0)
-                buf = io.BytesIO()
-                sf.write(buf, w, sr, subtype="PCM_16", format="WAV")
-                req = urllib.request.Request(MUSCI_URL, data=buf.getvalue(),
-                    headers={"Content-Type": "audio/wav"}, method="POST")
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    text = json.loads(r.read().decode()).get("text", "").strip()
-                log(f"amplify-rescue: asr returned {len(text)} chars: {text[:100]!r}")
-            except Exception as e:
-                log(f"amplify-rescue failed: {type(e).__name__}: {e}")
+        # Empty-ASR retrying is owned by musci-server (it knows the model's
+        # failure mode; one owner for one concern). Verified 2026-11-28: the
+        # model returns '' on healthy speech deterministically and eps-dither
+        # recovers it server-side. No client-side retry needed.
 
         # Ground truth for the diagnosis: keep the audio of every failed /
         # ultra-quiet cycle (bounded retention). Synthetic tests proved quiet
