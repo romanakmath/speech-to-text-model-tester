@@ -5,29 +5,43 @@ Three distinct root causes were confirmed for the user-visible symptoms
 but repressing does nothing, nothing gets pasted", intermittent
 "no speech detected").
 
-## 1. App crash at first overlay draw after standby → dictation silently lost
+## 1. App crash mid-dictation → dictation silently lost
 
 **Symptom**: press ⌘⇧D → "● REC" appears → press to stop → *nothing happens*,
-nothing pasted.
+nothing pasted (app crashes; launchd KeepAlive relaunches instantly, so it
+*looks* like the stop press did nothing).
 
-**Evidence**: crash reports `Python-2026-11-28-142852.ips` (also 11-23, 11-24):
-SIGABRT/SIGSEGV in `CA::Transaction::commit` → `CoreGraphics dl_Finalize` →
-`POINTER_BEING_FREED_WAS_NOT_ALLOCATED`, both main thread and a CA thread
-finalizing the same display-list resources. The dictation-menubar app kept ONE
-overlay NSWindow alive for days; macOS invalidates its CoreGraphics
-display-list during standby; the first redraw after wake ("● REC") frees a
-stale pointer → abort. KeepAlive relaunches the app instantly, so the
-repress "works" again — but the dictation recorded before the crash is lost
-(user perceives: "nothing happened"). Crash cadence ≈ every 1–4 days,
-always the first dictation after standby.
+**Root cause (corrected after a wrong first diagnosis)**: AppKit UI access
+from non-main threads. The overlay NSWindow was correctly marshaled to the
+main thread via a queue, but rumps' `self.title = "●"` setter — called from
+the **event-tap callback thread** (`toggle → start/stop`) and from the
+**`_finish` worker thread** (`_done`) — mutates the NSStatusItem UI and
+creates CoreAnimation transactions on those threads' runloops. Those CA
+transactions race the main-thread overlay transactions on shared layer
+state → CG display-list resource double-free.
 
-**Fix** (`dictate-menubar.py`): create the overlay window fresh on every
-show (destroy the old one). A window now lives at most one dictation cycle,
-so it never carries stale display-list resources across sleep/wake.
-Plus: kill orphaned `rec` children at startup (a crashed parent leaves sox
-recording forever — holds the mic, writes to an unlinked, ever-growing file),
-and show a "still transcribing…" notification when the hotkey is pressed
-during BUSY (previously silently ignored).
+**Evidence**: crash reports 11-23 (SIGSEGV), 11-24 & 14:28 (SIGABRT): both
+the event-tap thread's runloop and the main runloop caught in
+`CA::Transaction::flush_as_runloop_observer → CA::Layer::display_if_needed →
+dl_Finalize → POINTER_BEING_FREED_WAS_NOT_ALLOCATED`. The tap runloop only
+has CA observers because the title setter created transactions there. The
+standby correlation was a red herring — post-wake CoreAnimation rebuild
+widens the race window.
+
+**Wrong first fix (kept for the record)**: "recreate the overlay window per
+show + close()" — diagnosed as stale display-lists across standby. The
+window-per-show part was harmless, but `win.close()` from pyobjc
+**over-releases** the NSWindow (close() releases the ObjC object, the
+Python wrapper releases it again → zombie → SIGSEGV in
+`objc_autoreleasePoolPop`, crash 2026-11-28 17:02, introduced by that fix).
+
+**Correct fix**: (a) ALL AppKit mutations go through the single main-thread
+pump — the title is now set via the overlay queue ("title" op) drained by
+the 0.10 s rumps timer; (b) persistent overlay window, created lazily on
+the main thread, never destroyed (orderOut to hide; no close/release
+anywhere). Plus: kill orphaned `rec` children at startup (a crashed parent
+leaves sox recording forever), and a "still transcribing…" notification
+when the hotkey is pressed during BUSY (previously silently ignored).
 
 ## 2. First transcription after standby takes ~20–40 s ("wait unnecessarily long")
 

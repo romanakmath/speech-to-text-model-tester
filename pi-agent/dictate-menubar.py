@@ -167,6 +167,8 @@ def deliver_text(text: str) -> str:
     target, bundle_id = "?", ""
     try:
         from AppKit import NSWorkspace
+        # read-only probe (no layer/UI mutation -> creates no CA transaction);
+        # safe off-main, unlike UI writes. All UI writes go through _ovq.
         app = NSWorkspace.sharedWorkspace().frontmostApplication()
         target = app.localizedName()
         bundle_id = app.bundleIdentifier() or ""
@@ -236,10 +238,20 @@ class DictateApp(rumps.App):
     # ---------------- visual overlay (main thread only) ----------------
 
     def _drain_overlay(self, _sender=None):
+        """Single place where AppKit gets touched: this rumps timer runs on
+        the MAIN thread, and every AppKit mutation in the app is marshaled
+        here via _ovq. Calling AppKit from other threads (the event-tap
+        callback, _finish worker) was the root cause of the recurring
+        SIGABRT/SIGSEGV crashes: rumps' self.title setter from the tap
+        thread created CoreAnimation transactions there, racing the
+        main-thread overlay transactions -> display-list double-free
+        (crash reports 2026-11-23/24/28)."""
         try:
             while True:
                 op, text, rgb = self._ovq.get_nowait()
-                if op == "show":
+                if op == "title":
+                    self.title = text
+                elif op == "show":
                     self._overlay_show(text, rgb)
                 else:
                     self._overlay_hide()
@@ -250,39 +262,32 @@ class DictateApp(rumps.App):
         if not HAS_APPKIT:
             return
         try:
-            # CRASH FIX: create the window FRESH on every show. The old code
-            # kept one NSWindow alive for days across sleep/wake cycles;
-            # macOS invalidates its CoreGraphics display-list resources during
-            # standby, and the first redraw after wake double-freed a stale
-            # pointer -> SIGABRT/SIGSEGV (crash reports 2026-11-23/24/28),
-            # killing the app mid-recording and silently losing the dictation
-            # ("pressed to stop and nothing happened").
-            if self._overlay is not None:
-                try:
-                    old_win = self._overlay[0]
-                    old_win.orderOut_(None)
-                    old_win.close()
-                except Exception:
-                    pass
-                self._overlay = None
-            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 260, 64), 0, 2, False)
-            win.setLevel_(25)  # NSStatusWindowLevel — above all normal windows
-            win.setOpaque_(False)
-            win.setHasShadow_(True)
-            win.setIgnoresMouseEvents_(True)
-            win.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces |
-                NSWindowCollectionBehaviorFullScreenAuxiliary)
-            label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 64))
-            label.setEditable_(False)
-            label.setBordered_(False)
-            label.setDrawsBackground_(False)
-            label.setAlignment_(NSCenterTextAlignment)
-            label.setFont_(NSFont.boldSystemFontOfSize_(24))
-            label.setTextColor_(NSColor.whiteColor())
-            win.contentView().addSubview_(label)
-            self._overlay = (win, label)
+            # Persistent window, created lazily here (main thread only) and
+            # never destroyed: shown/hidden via orderFront/orderOut and
+            # updated in place. No close()/release anywhere — manual teardown
+            # of an NSWindow from pyobjc over-releases it (close() releases
+            # the ObjC object, the Python wrapper releases it again -> zombie
+            # -> SIGSEGV in autoreleasePoolPop, crash 2026-11-28 17:02).
+            if self._overlay is None:
+                win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                    NSMakeRect(0, 0, 260, 64), 0, 2, False)
+                win.setLevel_(25)  # NSStatusWindowLevel — above all normal windows
+                win.setOpaque_(False)
+                win.setHasShadow_(True)
+                win.setIgnoresMouseEvents_(True)
+                win.setCollectionBehavior_(
+                    NSWindowCollectionBehaviorCanJoinAllSpaces |
+                    NSWindowCollectionBehaviorFullScreenAuxiliary)
+                label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 64))
+                label.setEditable_(False)
+                label.setBordered_(False)
+                label.setDrawsBackground_(False)
+                label.setAlignment_(NSCenterTextAlignment)
+                label.setFont_(NSFont.boldSystemFontOfSize_(24))
+                label.setTextColor_(NSColor.whiteColor())
+                win.contentView().addSubview_(label)
+                self._overlay = (win, label)
+            win, label = self._overlay
             win.setBackgroundColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 rgb[0], rgb[1], rgb[2], 0.94))
             label.setStringValue_(text)
@@ -297,16 +302,9 @@ class DictateApp(rumps.App):
         if not HAS_APPKIT or self._overlay is None:
             return
         try:
-            # Full teardown (not just orderOut): with close-on-hide, no
-            # NSWindow exists between dictations — one can never sleep and
-            # wake with invalidated display-list resources (crash cause).
-            win, _label = self._overlay
-            win.orderOut_(None)
-            win.close()
+            self._overlay[0].orderOut_(None)
         except Exception as e:
             log(f"overlay hide failed: {type(e).__name__}: {e}")
-        finally:
-            self._overlay = None
 
     def _ov(self, op, text="", rgb=(1, 1, 1)):
         self._ovq.put((op, text, rgb))
@@ -454,7 +452,7 @@ class DictateApp(rumps.App):
             notify("sox missing", REC_BIN)
             return
         self.state = REC
-        self.title = "●"
+        self._ov("title", "●")
         self._ov("show", "● REC", (1.0, 0.22, 0.19))
         log(f"recording… [mic: {self._mic}]")
 
@@ -462,7 +460,7 @@ class DictateApp(rumps.App):
         if self.state != REC:
             return
         self.state = BUSY
-        self.title = "⏳"
+        self._ov("title", "⏳")
         self._ov("show", "⏳ transcribing…", (1.0, 0.60, 0.0))
         # proc teardown happens in _finish (worker thread) — the tap callback
         # must return in milliseconds or macOS disables the tap
@@ -481,7 +479,7 @@ class DictateApp(rumps.App):
             if self.proc:
                 self.proc.terminate()
         self.state = IDLE
-        self.title = "🎙"
+        self._ov("title", "🎙")
         self._ov("hide")
 
     @rumps.clicked("Check server")
@@ -590,7 +588,7 @@ class DictateApp(rumps.App):
 
     def _done(self):
         self.state = IDLE
-        self.title = "🎙"
+        self._ov("title", "🎙")
         self._ov("hide")
         log("cycle complete")
 
