@@ -415,11 +415,17 @@ class DictateApp(rumps.App):
         elif self.state == BUSY:
             # first request after standby can take ~20-40 s (weights paged
             # out); make the wait visible instead of silently swallowing the
-            # hotkey press ("I repressed and nothing happened")
+            # hotkey press ("I repressed and nothing happened").
+            # NOTE: async — the tap callback must return in milliseconds or
+            # macOS disables the event tap; osascript notify takes seconds.
             now = time.time()
             if now - getattr(self, "_busy_noted", 0.0) > 10:
                 self._busy_noted = now
-                notify("still transcribing…", "server may be warming up after standby")
+                threading.Thread(
+                    target=notify,
+                    args=("still transcribing…",
+                          "server may be warming up after standby"),
+                    daemon=True).start()
 
     def start(self):
         if self.state != IDLE:
